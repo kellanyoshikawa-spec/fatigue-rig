@@ -56,7 +56,7 @@
 
 <script>
 // ---- defaults (the key is entered once on the phone, not stored in this file)
-const DEFAULT_URL = 'https://script.google.com/macros/s/AKfycbxZjCMSgq3SzbsBjMyOSfM_OozwCewwiMGdSQiWmKfGrQZgYRlfas6NPTGPgZyFCiPC/exec';
+const DEFAULT_URL = 'https://script.google.com/macros/s/AKfycbxCYOVM6_Pd-8hx9XWVNuiWfeR_nt29iqd5fvY682Q4g_yByNRJs6Um6TCa_ZEpi-Ql/exec';
 const NUS = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
 const RX  = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';   // phone -> board
 const TX  = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';   // board -> phone
@@ -83,10 +83,11 @@ $('go').onclick = run;
 
 // ---- UI helpers
 const STEPS = ['Connect to the rig', 'Download new data', 'Upload to Google', 'Confirm with the rig'];
-function steps(active) {
+function steps(active, note) {
   $('stepsCard').style.display = 'block';
   $('steps').innerHTML = STEPS.map((s, i) =>
-    '<div class="' + (i < active ? 'done' : i === active ? 'now' : '') + '">' + s + '</div>').join('');
+    '<div class="' + (i < active ? 'done' : i === active ? 'now' : '') + '">' + s +
+    (i === active && note ? ' - ' + note : '') + '</div>').join('');
 }
 function result(msg, ok) { const r = $('result'); r.textContent = msg; r.className = 'card ' + (ok ? 'ok' : 'bad'); }
 function showLast() {
@@ -121,11 +122,11 @@ async function run() {
   $('result').className = 'card';
   let lines = [];
   let buf = '';
-  let collecting = false;
+  let collecting = false;   // reset for each batch
   let listeners = [];
   const onLine = line => {
     if (line.startsWith('# ----- begin data')) { collecting = true; lines = []; }
-    else if (collecting && !line.startsWith('#') && line.trim()) lines.push(line.trim());
+    else if (collecting && !line.startsWith('#') && line.indexOf('lc,test') !== 0 && line.trim()) lines.push(line.trim());
     listeners.forEach(f => f(line));
   };
   const waitForLine = (test, ms) => new Promise((resolve, reject) => {
@@ -158,22 +159,40 @@ async function run() {
     };
     await sleep(2200);                                   // let the rig's greeting finish
 
-    steps(1);
-    await cmd('send');
-    const endLine = await waitForLine(l => l.startsWith('# ----- end'), 120000);
-    const count = lines.length;
+    // The rig sends the data in batches. Each batch is uploaded and confirmed
+    // before the next one, so nothing is deleted from the rig until Google has it.
+    let count = 0, batch = 0, report = 'No new data since the last collection.';
+    const reports = [];
+    while (true) {
+      batch++;
+      const note = batch > 1 ? 'batch ' + batch + ' (' + count + ' so far)' : '';
+      steps(1, note);
+      lines = [];
+      collecting = false;
+      await cmd('send');
+      const endLine = await waitForLine(l => l.startsWith('# ----- end'), 120000);
+      const m = endLine.match(/end:\s*(\d+)\s*data point\(s\)\s*more=(\d)/);
+      if (!m) throw new Error('the rig sent an answer this page did not understand');
+      const said = Number(m[1]), more = m[2] === '1';
+      if (said !== lines.length) {
+        throw new Error('part of the data was lost on the way (' + lines.length + ' of ' + said + ')');
+      }
 
-    steps(2);
-    let report = 'No new data since the last collection.';
-    if (count > 0) {
-      const text = 'lc,test,cycle\n' + lines.join('\n');
-      report = await postToGoogle({ text });
+      if (said > 0) {
+        steps(2, note);
+        reports.push(await postToGoogle({ text: 'lc,test,cycle\n' + lines.join('\n') }));
+
+        steps(3, note);
+        await cmd('ack ' + said);
+        const ackLine = await waitForLine(l => l.startsWith('# ack'), 15000);
+        if (ackLine.indexOf('ack ok') < 0) throw new Error('the rig did not accept the confirmation');
+        count += said;
+      }
+      if (!more) break;
+      if (batch > 200) throw new Error('too many batches - collect again');
     }
-
-    steps(3);
-    await cmd('ack');
-    await waitForLine(l => l.startsWith('# ack'), 15000);
     steps(4);
+    if (reports.length) report = reports.join('\n');
 
     const when = new Date().toLocaleString();
     store.set('lastOk', when + ' (' + count + ' data points)');
